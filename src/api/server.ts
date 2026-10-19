@@ -83,7 +83,7 @@ const loadIdentity = () => db.prepare(`SELECT * FROM identity WHERE id=1`).get()
 
 /* ------------------------------- Types ---------------------------------- */
 type MarketRegime = "BULL" | "BEAR" | "CHOPPY" | "VOLATILE" | "UNKNOWN";
-type Decision = "PROCEED" | "HOLD" | "VETO";
+type Decision = "PROCEED" | "EXIT" | "HOLD" | "VETO";
 
 /* ------------------------------- Globals -------------------------------- */
 let identity = {
@@ -117,7 +117,7 @@ let globalIdentitySeries: { t: number; aggression: number; caution: number; expl
 let globalIdentityEvent: { timestamp: number; message: string } | null = null;
 
 /* --------------------------- Execution Adapter --------------------------- */
-const executionAdapter = new KrakenPaperAdapter();
+const executionAdapter = new KrakenPaperAdapter(CONFIG.CAPITAL);
 
 /* --------------------------- Utility helpers ---------------------------- */
 function computePositionSize(
@@ -230,29 +230,33 @@ async function runEngineTick() {
     let decision: Decision = "HOLD";
     if (forecastResult.next === "BULL" && forecastResult.probability > 0.55 && identity.aggression > 0.4 && identity.caution < 0.8) {
       decision = "PROCEED";
+    } else if (forecastResult.next === "BEAR" && executionAdapter.getPositionQuantity("XBTUSD") > 0) {
+      decision = "EXIT";
     }
     if (riskState.killSwitch) decision = "VETO";
 
-    // Execution
+    // Execution: all orders remain inside the local paper adapter.
     let execResult: ExecutionResult | null = null;
-    if (decision === "PROCEED") {
-      const notional = computePositionSize(riskState, null, identity, regime);
+    if (decision === "PROCEED" || decision === "EXIT") {
+      const side = decision === "PROCEED" ? "BUY" : "SELL";
+      const notional = decision === "EXIT"
+        ? executionAdapter.getPositionQuantity("XBTUSD") * lastPrice
+        : computePositionSize(riskState, null, identity, regime);
       const intent: TradeIntent = {
         symbol: "XBTUSD",
-        side: "BUY",
+        side,
         notional,
         timestamp: now(),
-        reason: `Argus Signal: ${regime}`,
+        reason: decision === "EXIT" ? "Risk exit: bearish regime" : `Argus Signal: ${regime}`,
       };
       execResult = await executionAdapter.execute(intent);
       if (execResult) globalTradeHistory.push(execResult);
     }
 
-    // Update PnL series (consistent shape)
-    const lastTrade = globalTradeHistory[globalTradeHistory.length - 1];
-    const tickPnl = lastTrade ? (lastTrade.filledNotional - (lastTrade.requestedNotional ?? 0)) : 0;
-    const prevCumulative = globalPnlSeries.length ? globalPnlSeries[globalPnlSeries.length - 1].pnl : 0;
-    const cumulative = prevCumulative + tickPnl;
+    // Report actual marked-to-market equity. Never infer PnL from order notional.
+    const account = executionAdapter.getAccountSnapshot();
+    const cumulative = account.equity - CONFIG.CAPITAL;
+    const tickPnl = execResult?.pnl ?? 0;
     globalPnlSeries.push({ t: now(), pnl: cumulative });
     if (globalPnlSeries.length > 500) globalPnlSeries.shift();
 
@@ -260,13 +264,12 @@ async function runEngineTick() {
     saveMemory(regime, decision, tickPnl);
     saveIdentity(identity.aggression, identity.caution, identity.exploration, explorationRate);
 
-    // Update risk state (simple)
     riskState.sessionPnL = cumulative;
-    riskState.equity = CONFIG.CAPITAL + cumulative;
+    riskState.equity = account.equity;
     if (riskState.equity < CONFIG.CAPITAL * 0.5) riskState.killSwitch = true;
 
-    globalStatus = decision === "PROCEED" ? "PROCEED" : "HOLD";
-    logger.info("Engine tick", { regime, decision, lastPrice, equity: riskState.equity });
+    globalStatus = decision;
+    logger.info("Engine tick", { regime, decision, lastPrice, equity: riskState.equity, cash: account.cash, feesPaid: account.feesPaid });
   } catch (err) {
     logger.error("runEngineTick error", err);
     globalStatus = "ERROR";
