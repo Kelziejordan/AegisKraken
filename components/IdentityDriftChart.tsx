@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import {
   LineChart,
   Line,
@@ -33,11 +32,13 @@ export function IdentityDriftChart({ snapshots }: { snapshots: any[] }) {
               labelFormatter={(t) =>
                 new Date(t as number).toLocaleTimeString()
               }
-              formatter={(value: any, name: string, props: any) => {
-                const event = props.payload.event;
+              formatter={(value, name, props) => {
+                const numericValue = typeof value === "number" ? value : Number(value);
+                const label = typeof name === "string" ? name : String(name ?? "");
+                const event = props?.payload?.event;
                 return [
-                  value.toFixed(3),
-                  event ? `${name} (${event})` : name
+                  Number.isFinite(numericValue) ? numericValue.toFixed(3) : String(value ?? ""),
+                  event ? `${label} (${event})` : label
                 ];
               }}
             />
